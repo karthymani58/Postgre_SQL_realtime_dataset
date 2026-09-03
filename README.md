@@ -58,26 +58,6 @@ The query assumes a standard Odoo core database structure with the following tab
 * **`daily_combined_sales`**: Merges POS and B2B/Sales order lines by date and product ID.
 * **`aggregated_sales` & `fsn_xyz_calculated`**: Computes standard deviations, active days, daily averages, and FSN/XYZ metrics.
 
-
-
-## Query Architecture & Execution Flow
-
-```mermaid
-graph TD
-    A[date_config] --> FSN_XYZ[fsn_xyz_calculated]
-    B[unique_mktg_map] --> Final[Final Select]
-    C[base_costs] --> BOM[bom_calculated]
-    C --> Final
-    D[stock_valuation_cost] --> Final
-    E[sales_so] --> Combined[daily_combined_sales]
-    F[sales_pos] --> Combined
-    Combined --> Agg[aggregated_sales]
-    Agg --> FSN_XYZ
-    BOM --> Final
-    Agg --> Final
-    FSN_XYZ --> Final
-
-
 ## Output Fields
 
 | Column Name | Data Type | Description |
@@ -98,3 +78,23 @@ graph TD
 | `daily_avg_sales_qty` | `numeric` | Average sales volume per calendar day |
 | `max_daily_sales_qty` | `numeric` | Peak daily sales volume achieved |
 | `6M Avg Sales (Units/ Month)` | `numeric` | Monthly run-rate over the 6-month period |
+
+
+## Query Architecture & Execution Flow
+
+```mermaid
+graph TD
+    A[date_config] --> FSN_XYZ[fsn_xyz_calculated]
+    B[unique_mktg_map] --> Final[Final Select]
+    C[base_costs] --> BOM[bom_calculated]
+    C --> Final
+    D[stock_valuation_cost] --> Final
+    E[sales_so] --> Combined[daily_combined_sales]
+    F[sales_pos] --> Combined
+    Combined --> Agg[aggregated_sales]
+    Agg --> FSN_XYZ
+    BOM --> Final
+    Agg --> Final
+    FSN_XYZ --> Final
+
+
