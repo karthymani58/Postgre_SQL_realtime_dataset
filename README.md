@@ -39,6 +39,26 @@ $$\text{CV} = \frac{\text{Standard Deviation of Daily Sales}}{\text{Mean Daily S
 | **Z** | Sporadic / Unpredictable | $\text{CV} > 1.0\text{ or } 0\text{ Sales}$ |
 
 ---
+## Schema Requirements
+
+The query assumes a standard Odoo core database structure with the following tables:
+
+* **Products**: `product_product`, `product_template`
+* **Configuration & Metadata**: `ir_property`, `mktg_pdt_category_map` *(custom/extension map)*
+* **Inventory & Manufacturing**: `stock_valuation_layer`, `mrp_bom`, `mrp_bom_line`
+* **Sales**: `sale_order`, `sale_order_line`, `pos_order`, `pos_order_line`
+
+## Pipeline Overview
+
+* **`date_config`**: Establishes dynamic 6-month historical windows based on `CURRENT_DATE`.
+* **`unique_mktg_map`**: Deduplicates product marketing categories to fetch the latest target month profile.
+* **`base_costs`**: Parses standard prices from Odoo's `ir_property` table for both variants and templates.
+* **`stock_valuation_cost`**: Obtains the latest unit cost from `stock_valuation_layer`.
+* **`bom_calculated`**: Dynamically calculates BoM component costs using active manufacturing structures.
+* **`daily_combined_sales`**: Merges POS and B2B/Sales order lines by date and product ID.
+* **`aggregated_sales` & `fsn_xyz_calculated`**: Computes standard deviations, active days, daily averages, and FSN/XYZ metrics.
+
+
 
 ## Query Architecture & Execution Flow
 
