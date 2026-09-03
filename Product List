@@ -1,0 +1,257 @@
+WITH date_config AS (
+    -- Precise date boundaries and month/day counts
+    SELECT
+        date_trunc('month', CURRENT_DATE)::date AS end_date,
+        (date_trunc('month', CURRENT_DATE) - INTERVAL '6 months')::date AS start_6m,
+        date_part('day', (date_trunc('month', CURRENT_DATE) + INTERVAL '1 month' - INTERVAL '1 day'))::numeric AS days_current_month,
+        (date_trunc('month', CURRENT_DATE)::date - (date_trunc('month', CURRENT_DATE) - INTERVAL '6 months')::date)::numeric AS days_6m
+),
+unique_mktg_map AS (
+    -- Deduplicate marketing map: Exactly 1 row per product_id (latest target_month)
+    SELECT DISTINCT ON (product_id)
+        product_id,
+        mtkg_category_l1,
+        target_month,
+        abc
+    FROM public.mktg_pdt_category_map
+    ORDER BY product_id, target_month DESC NULLS LAST
+),
+base_costs AS (
+    -- Fetch direct standard_price (Deduplicated per product_id)
+    SELECT DISTINCT ON (pp.id)
+        pp.id AS product_id,
+        pp.product_tmpl_id,
+        COALESCE(
+            NULLIF(prop_p.value_float, 0),
+            NULLIF(prop_t.value_float, 0),
+            NULLIF(CASE WHEN prop_p.value_reference ~ '^[0-9]+(\.[0-9]+)?$' THEN prop_p.value_reference::numeric ELSE 0 END, 0),
+            NULLIF(CASE WHEN prop_t.value_reference ~ '^[0-9]+(\.[0-9]+)?$' THEN prop_t.value_reference::numeric ELSE 0 END, 0),
+            0
+        ) AS direct_cost
+    FROM product_product pp
+    JOIN product_template pt ON pp.product_tmpl_id = pt.id
+    LEFT JOIN ir_property prop_p 
+        ON prop_p.res_id = 'product.product,' || pp.id 
+       AND prop_p.name = 'standard_price'
+       AND (prop_p.company_id IS NULL OR prop_p.company_id = 1)
+    LEFT JOIN ir_property prop_t 
+        ON prop_t.res_id = 'product.template,' || pt.id 
+       AND prop_t.name = 'standard_price'
+       AND (prop_t.company_id IS NULL OR prop_t.company_id = 1)
+    ORDER BY pp.id
+),
+stock_valuation_cost AS (
+    -- Get latest unit cost from Stock Valuation Layer per product_id
+    SELECT DISTINCT ON (product_id)
+        product_id,
+        unit_cost
+    FROM stock_valuation_layer
+    WHERE unit_cost > 0
+    ORDER BY product_id, create_date DESC, id DESC
+),
+bom_calculated AS (
+    -- Deduplicate BoM costs: Aggregate by target product/template ID
+    SELECT 
+        bom.product_id AS target_product_id,
+        bom.product_tmpl_id AS target_tmpl_id,
+        SUM(line.product_qty * bc.direct_cost) AS bom_total_cost
+    FROM mrp_bom bom
+    JOIN mrp_bom_line line ON line.bom_id = bom.id
+    JOIN base_costs bc ON line.product_id = bc.product_id
+    WHERE bom.active = TRUE
+    GROUP BY bom.product_id, bom.product_tmpl_id
+),
+sales_so AS (
+    -- Sales from Sale Orders (Invoices) grouped by Product and Date
+    SELECT 
+        sol.product_id,
+        so.date_order::date AS sales_date,
+        SUM(sol.product_uom_qty) AS qty
+    FROM sale_order_line sol
+    JOIN sale_order so ON sol.order_id = so.id
+    CROSS JOIN date_config dc
+    WHERE so.state NOT IN ('draft', 'cancel')
+      AND so.date_order >= dc.start_6m
+      AND so.date_order < dc.end_date
+    GROUP BY sol.product_id, so.date_order::date
+),
+sales_pos AS (
+    -- Sales from Point of Sale (POS) grouped by Product and Date
+    SELECT 
+        pol.product_id,
+        po.date_order::date AS sales_date,
+        SUM(pol.qty) AS qty
+    FROM pos_order_line pol
+    JOIN pos_order po ON pol.order_id = po.id
+    CROSS JOIN date_config dc
+    WHERE po.state IN ('done', 'invoiced', 'paid')
+      AND po.date_order >= dc.start_6m
+      AND po.date_order < dc.end_date
+    GROUP BY pol.product_id, po.date_order::date
+),
+daily_combined_sales AS (
+    -- Group combined sales by product_id and sales_date
+    SELECT 
+        product_id,
+        sales_date,
+        SUM(qty) AS daily_qty
+    FROM (
+        SELECT product_id, sales_date, qty FROM sales_so
+        UNION ALL
+        SELECT product_id, sales_date, qty FROM sales_pos
+    ) combined_daily
+    GROUP BY product_id, sales_date
+),
+aggregated_sales AS (
+    -- Total sales, max sales, standard deviation & active sales days per product_id
+    SELECT 
+        product_id,
+        SUM(daily_qty) AS total_sold_6m,
+        MAX(daily_qty) AS max_daily_sales,
+        COUNT(DISTINCT sales_date) AS active_days,
+        STDDEV_SAMP(daily_qty) AS stddev_daily_sales
+    FROM daily_combined_sales
+    GROUP BY product_id
+),
+fsn_xyz_calculated AS (
+    -- Compute FSN & XYZ Metrics per product_id
+    SELECT 
+        s.product_id,
+        s.total_sold_6m,
+        s.max_daily_sales,
+        
+        -- Coefficient of Variation = Standard Deviation / Mean Daily Sales
+        CASE 
+            WHEN s.total_sold_6m > 0 AND s.active_days > 1 
+            THEN COALESCE(s.stddev_daily_sales, 0) / (s.total_sold_6m / s.active_days)
+            ELSE 999 
+        END AS cv_demand,
+
+        -- FSN Classification Logic
+        CASE 
+            WHEN COALESCE(s.total_sold_6m, 0) = 0 THEN 'N'              -- Non-Moving (0 Sold)
+            WHEN s.total_sold_6m >= 100 THEN 'F'                         -- Fast-Moving
+            ELSE 'S'                                                     -- Slow-Moving
+        END AS fsn_classification,
+
+        -- XYZ Classification Logic (Based on Coefficient of Variation)
+        CASE 
+            WHEN COALESCE(s.total_sold_6m, 0) = 0 THEN 'Z'              -- No sales = Unpredictable / Z
+            WHEN (COALESCE(s.stddev_daily_sales, 0) / (s.total_sold_6m / NULLIF(s.active_days, 0))) <= 0.5 THEN 'X'  -- Regular/Predictable
+            WHEN (COALESCE(s.stddev_daily_sales, 0) / (s.total_sold_6m / NULLIF(s.active_days, 0))) <= 1.0 THEN 'Y'  -- Medium Fluctuation
+            ELSE 'Z'                                                     -- High Fluctuation / Sporadic
+        END AS xyz_classification
+    FROM aggregated_sales s
+)
+
+-- Final Output: Guaranteed 1 Row per SKU
+SELECT DISTINCT ON (pp.default_code)
+    pp.default_code                                         AS internal_reference,
+    pp.barcode                                              AS barcode,
+    
+    -- Safe Product Name extraction
+    CASE 
+        WHEN pg_typeof(pt.name)::text = 'jsonb' OR pg_typeof(pt.name)::text = 'json' 
+        THEN COALESCE(pt.name->>'en_US', pt.name::text)
+        ELSE pt.name::text
+    END                                                     AS product_name,
+
+    -- Description Full
+    '[' || pp.default_code || '] ' || 
+    CASE 
+        WHEN pg_typeof(pt.name)::text = 'jsonb' OR pg_typeof(pt.name)::text = 'json' 
+        THEN COALESCE(pt.name->>'en_US', pt.name::text)
+        ELSE pt.name::text
+    END                                                     AS description_full,
+    
+    map.mtkg_category_l1,
+    map.target_month,
+    COALESCE(map.abc, 'C')                                  AS abc_classification,
+
+    -- Dynamic FSN & XYZ Classifications
+    COALESCE(fx.fsn_classification, 'N')                    AS fsn_classification,
+    COALESCE(fx.xyz_classification, 'Z')                    AS xyz_classification,
+
+    -- Combined Matrix (e.g., AX, BY, CZ)
+    COALESCE(map.abc, 'C') || COALESCE(fx.xyz_classification, 'Z') AS abc_xyz_matrix,
+
+    -- Multi-fallback Cost Price Lookup
+    COALESCE(
+        NULLIF(bc.direct_cost, 0), 
+        svl.unit_cost,
+        bom_calc_var.bom_total_cost,
+        bom_calc_tmpl.bom_total_cost,
+        0
+    )                                                       AS cost_price,
+
+    pt.list_price                                           AS mrp,
+
+    -- Shelf Life in Months
+    ROUND(
+        COALESCE(
+            NULLIF(pt.expiration_time, 0), 
+            NULLIF(pt.use_time, 0), 
+            0
+        ) / 30.0, 1
+    )                                                       AS shelf_life_months,
+
+    -- Total 6M Sold Units (Exact Unique Quantity)
+    COALESCE(sales.total_sold_6m, 0)                        AS total_6m_sold_qty,
+
+    -- Daily Avg Sales QTY (6M Window)
+    ROUND(
+        COALESCE(sales.total_sold_6m, 0)::numeric / NULLIF(dc.days_6m, 0), 
+        2
+    )                                                       AS daily_avg_sales_qty,
+
+    -- Maximum Daily Sales QTY
+    COALESCE(sales.max_daily_sales, 0)                      AS max_daily_sales_qty,
+
+    -- 6M Monthly Avg Sales Units (Standard 6-Month Run Rate)
+    ROUND(
+        COALESCE(sales.total_sold_6m, 0)::numeric / 6.0, 
+        0
+    )                                                       AS "6M Avg Sales (Units/ Month)"
+
+FROM unique_mktg_map map
+JOIN product_product pp 
+    ON map.product_id = pp.id
+JOIN product_template pt 
+    ON pp.product_tmpl_id = pt.id
+CROSS JOIN date_config dc
+
+-- Base Direct Costs (Pre-deduplicated)
+LEFT JOIN base_costs bc
+    ON bc.product_id = pp.id
+
+-- Valuation Layer Cost Fallback (Pre-deduplicated)
+LEFT JOIN stock_valuation_cost svl
+    ON svl.product_id = pp.id
+
+-- BoM Computed Cost (Variant Level)
+LEFT JOIN bom_calculated bom_calc_var
+    ON bom_calc_var.target_product_id = pp.id
+
+-- BoM Computed Cost (Template Level)
+LEFT JOIN bom_calculated bom_calc_tmpl
+    ON bom_calc_tmpl.target_tmpl_id = pt.id
+
+-- Exact 6-Month Combined Sales (Pre-aggregated per product_id)
+LEFT JOIN aggregated_sales sales
+    ON sales.product_id = pp.id
+
+-- FSN & XYZ Calculations (Pre-aggregated per product_id)
+LEFT JOIN fsn_xyz_calculated fx
+    ON fx.product_id = pp.id
+
+WHERE 
+    pp.default_code IS NOT NULL 
+    AND TRIM(pp.default_code) != ''
+    AND pp.default_code NOT ILIKE '%Old' 
+    AND pp.default_code NOT IN ('Delivery_007', 'TIPS', 'DISC')
+    AND pt.name::text NOT ILIKE '%Stainless Steel Scrap%'
+    AND pt.name::text NOT ILIKE '%Carton box scrap%'
+    AND pt.name::text NOT ILIKE '%50-Litre wet grinder%'
+    AND pt.name::text NOT ILIKE '12" Mini%'
+
+ORDER BY pp.default_code ASC, map.target_month DESC NULLS LAST;
