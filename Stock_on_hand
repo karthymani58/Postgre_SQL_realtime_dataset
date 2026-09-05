@@ -1,0 +1,47 @@
+WITH soh_data AS (
+    SELECT 
+        -- 1. Extract Primary Group
+        SPLIT_PART(sl.complete_name, '/', 1) AS primary_location_group,
+
+        -- 2. Extract Sub-Location / Zone
+        COALESCE(NULLIF(SPLIT_PART(sl.complete_name, '/', 2), ''), 'Main Level') AS sub_location_group,
+
+        -- 3. Detail & Product Fields
+        sl.complete_name AS full_location_path,
+        pp.default_code AS sku,
+        
+        -- Clean JSONB Translation in Odoo (removes {"en_US": ...})
+        COALESCE(
+            pt.name->>'en_US', 
+            pt.name->>'en_GB', 
+            pt.name::text
+        ) AS product_name,
+        
+        -- 4. Quantities
+        sq.quantity AS physical_soh,
+        sq.reserved_quantity AS reserved_soh,
+        (sq.quantity - sq.reserved_quantity) AS available_soh
+
+    FROM stock_quant sq
+    LEFT JOIN stock_location sl ON sq.location_id = sl.id
+    LEFT JOIN product_product pp ON sq.product_id = pp.id
+    LEFT JOIN product_template pt ON pp.product_tmpl_id = pt.id
+
+    WHERE sl.usage = 'internal'
+)
+SELECT 
+    primary_location_group,
+    sub_location_group,
+    full_location_path,
+    sku,
+    product_name,
+    SUM(physical_soh) AS total_physical_soh,
+    SUM(reserved_soh) AS total_reserved_soh,
+    SUM(available_soh) AS total_available_soh
+FROM soh_data
+WHERE 1=1
+  [[ AND primary_location_group IN ({{primary_group}}) ]]
+
+GROUP BY 1, 2, 3, 4, 5
+HAVING SUM(physical_soh) <> 0
+ORDER BY primary_location_group ASC, sub_location_group ASC, total_physical_soh DESC;
